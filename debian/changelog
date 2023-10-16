@@ -1,8 +1,15 @@
-haskell-http-client (0.6.4.1-deepin1) unstable; urgency=medium
+haskell-http-client (0.7.13.1-1) unstable; urgency=medium
 
-  * Rebuild
+  * New upstream release
 
- -- Deepin Packages Builder <packages@deepin.org>  Mon, 14 Nov 2022 17:39:12 +0800
+ -- Ilias Tsitsimpis <iliastsi@debian.org>  Sun, 23 Oct 2022 18:20:07 +0300
+
+haskell-http-client (0.7.11-1) unstable; urgency=medium
+
+  * New upstream release (Closes: #856700)
+  * Declare compliance with Debian policy 4.6.1
+
+ -- Ilias Tsitsimpis <iliastsi@debian.org>  Sun, 24 Jul 2022 14:41:26 +0300
 
 haskell-http-client (0.6.4.1-2) unstable; urgency=medium
 

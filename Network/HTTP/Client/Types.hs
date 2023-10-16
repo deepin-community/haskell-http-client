@@ -13,7 +13,12 @@ module Network.HTTP.Client.Types
     , throwHttp
     , toHttpException
     , Cookie (..)
+    , equalCookie
+    , equivCookie
+    , compareCookies
     , CookieJar (..)
+    , equalCookieJar
+    , equivCookieJar
     , Proxy (..)
     , RequestBody (..)
     , Popper
@@ -32,6 +37,7 @@ module Network.HTTP.Client.Types
     , ProxyOverride (..)
     , StreamFileStatus (..)
     , ResponseTimeout (..)
+    , ProxySecureMode (..)
     ) where
 
 import qualified Data.Typeable as T (Typeable)
@@ -53,6 +59,7 @@ import Network.Socket (HostAddress)
 import Data.IORef
 import qualified Network.Socket as NS
 import qualified Data.Map as Map
+import qualified Data.Set as Set
 import Data.Text (Text)
 import Data.Streaming.Zlib (ZlibException)
 import Data.CaseInsensitive as CI
@@ -263,26 +270,64 @@ data Cookie = Cookie
 newtype CookieJar = CJ { expose :: [Cookie] }
   deriving (Read, Show, T.Typeable)
 
--- This corresponds to step 11 of the algorithm described in Section 5.3 \"Storage Model\"
-instance Eq Cookie where
-  (==) a b = name_matches && domain_matches && path_matches
-    where name_matches = cookie_name a == cookie_name b
-          domain_matches = CI.foldCase (cookie_domain a) == CI.foldCase (cookie_domain b)
-          path_matches = cookie_path a == cookie_path b
+-- | Instead of '(==)'.
+--
+-- Since there was some confusion in the history of this library about how the 'Eq' instance
+-- should work, it was removed for clarity, and replaced by 'equal' and 'equiv'.  'equal'
+-- gives you equality of all fields of the 'Cookie' record.
+--
+-- @since 0.7.0
+equalCookie :: Cookie -> Cookie -> Bool
+equalCookie a b = and
+  [ cookie_name a == cookie_name b
+  , cookie_value a == cookie_value b
+  , cookie_expiry_time a == cookie_expiry_time b
+  , cookie_domain a == cookie_domain b
+  , cookie_path a == cookie_path b
+  , cookie_creation_time a == cookie_creation_time b
+  , cookie_last_access_time a == cookie_last_access_time b
+  , cookie_persistent a == cookie_persistent b
+  , cookie_host_only a == cookie_host_only b
+  , cookie_secure_only a == cookie_secure_only b
+  , cookie_http_only a == cookie_http_only b
+  ]
 
-instance Ord Cookie where
-  compare c1 c2
+-- | Equality of name, domain, path only.  This corresponds to step 11 of the algorithm
+-- described in Section 5.3 \"Storage Model\".  See also: 'equal'.
+--
+-- @since 0.7.0
+equivCookie :: Cookie -> Cookie -> Bool
+equivCookie a b = name_matches && domain_matches && path_matches
+  where name_matches = cookie_name a == cookie_name b
+        domain_matches = CI.foldCase (cookie_domain a) == CI.foldCase (cookie_domain b)
+        path_matches = cookie_path a == cookie_path b
+
+-- | Instead of @instance Ord Cookie@.  See 'equalCookie', 'equivCookie'.
+--
+-- @since 0.7.0
+compareCookies :: Cookie -> Cookie -> Ordering
+compareCookies c1 c2
     | S.length (cookie_path c1) > S.length (cookie_path c2) = LT
     | S.length (cookie_path c1) < S.length (cookie_path c2) = GT
     | cookie_creation_time c1 > cookie_creation_time c2 = GT
     | otherwise = LT
 
-instance Eq CookieJar where
-  (==) cj1 cj2 = (DL.sort $ expose cj1) == (DL.sort $ expose cj2)
+-- | See 'equalCookie'.
+--
+-- @since 0.7.0
+equalCookieJar :: CookieJar -> CookieJar -> Bool
+equalCookieJar (CJ cj1) (CJ cj2) = and $ zipWith equalCookie cj1 cj2
+
+-- | See 'equalCookieJar', 'equalCookie'.
+--
+-- @since 0.7.0
+equivCookieJar :: CookieJar -> CookieJar -> Bool
+equivCookieJar cj1 cj2 = and $
+  zipWith equivCookie (DL.sortBy compareCookies $ expose cj1) (DL.sortBy compareCookies $ expose cj2)
 
 instance Semigroup CookieJar where
-  (CJ a) <> (CJ b) = CJ (DL.nub $ DL.sortBy compare' $ a <> b)
-    where compare' c1 c2 =
+  (CJ a) <> (CJ b) = CJ (DL.nubBy equivCookie $ DL.sortBy mostRecentFirst $ a <> b)
+    where mostRecentFirst c1 c2 =
             -- inverse so that recent cookies are kept by nub over older
             if cookie_creation_time c1 > cookie_creation_time c2
                 then LT
@@ -298,10 +343,19 @@ instance Data.Monoid.Monoid CookieJar where
 -- | Define a HTTP proxy, consisting of a hostname and port number.
 
 data Proxy = Proxy
-    { proxyHost :: S.ByteString -- ^ The host name of the HTTP proxy.
+    { proxyHost :: S.ByteString -- ^ The host name of the HTTP proxy in URI format. IPv6 addresses in square brackets.
     , proxyPort :: Int -- ^ The port number of the HTTP proxy.
     }
     deriving (Show, Read, Eq, Ord, T.Typeable)
+
+-- | Define how to make secure connections using a proxy server.
+data ProxySecureMode =
+  ProxySecureWithConnect
+  -- ^ Use the HTTP CONNECT verb to forward a secure connection through the proxy.
+  | ProxySecureWithoutConnect
+  -- ^ Send the request directly to the proxy with an https URL. This mode can be
+  -- used to offload TLS handling to a trusted local proxy.
+  deriving (Show, Read, Eq, Ord, T.Typeable)
 
 -- | When using one of the 'RequestBodyStream' \/ 'RequestBodyStreamChunked'
 -- constructors, you must ensure that the 'GivesPopper' can be called multiple
@@ -441,6 +495,9 @@ data Request = Request
     -- ^ Requested host name, used for both the IP address to connect to and
     -- the @host@ request header.
     --
+    -- This is in URI format, with raw IPv6 addresses enclosed in square brackets.
+    -- Use 'strippedHostName' when making network connections.
+    --
     -- Since 0.1.0
     , port :: Int
     -- ^ The port to connect to. Also used for generating the @host@ request header.
@@ -557,6 +614,18 @@ data Request = Request
     -- when following a redirect. Default: keep all headers intact.
     --
     -- @since 0.6.2
+
+    , proxySecureMode :: ProxySecureMode
+    -- ^ How to proxy an HTTPS request.
+    --
+    -- Default: Use HTTP CONNECT.
+    --
+    -- @since 0.7.2
+
+    , redactHeaders :: Set.Set HeaderName
+    -- ^ List of header values being redacted in case we show Request.
+    --
+    -- @since 0.7.13
     }
     deriving T.Typeable
 
@@ -580,7 +649,7 @@ instance Show Request where
         , "  host                 = " ++ show (host x)
         , "  port                 = " ++ show (port x)
         , "  secure               = " ++ show (secure x)
-        , "  requestHeaders       = " ++ show (DL.map redactSensitiveHeader (requestHeaders x))
+        , "  requestHeaders       = " ++ show (DL.map (redactSensitiveHeader $ redactHeaders x) (requestHeaders x))
         , "  path                 = " ++ show (path x)
         , "  queryString          = " ++ show (queryString x)
         --, "  requestBody          = " ++ show (requestBody x)
@@ -590,12 +659,15 @@ instance Show Request where
         , "  redirectCount        = " ++ show (redirectCount x)
         , "  responseTimeout      = " ++ show (responseTimeout x)
         , "  requestVersion       = " ++ show (requestVersion x)
+        , "  proxySecureMode      = " ++ show (proxySecureMode x)
         , "}"
         ]
 
-redactSensitiveHeader :: Header -> Header
-redactSensitiveHeader ("Authorization", _) = ("Authorization", "<REDACTED>")
-redactSensitiveHeader h = h
+redactSensitiveHeader :: Set.Set HeaderName -> Header -> Header
+redactSensitiveHeader toRedact h@(name, _) =
+  if name `Set.member` toRedact
+    then (name, "<REDACTED>")
+    else h
 
 -- | A simple representation of the HTTP response.
 --
@@ -629,15 +701,25 @@ data Response body = Response
     -- be impossible.
     --
     -- Since 0.1.0
+    , responseOriginalRequest :: Request
+    -- ^ Holds original @Request@ related to this @Response@ (with an empty body).
+    -- This field is intentionally not exported directly, but made availble
+    -- via @getOriginalRequest@ instead.
+    --
+    -- Since 0.7.8
     }
-    deriving (Show, Eq, T.Typeable, Functor, Data.Foldable.Foldable, Data.Traversable.Traversable)
+    deriving (Show, T.Typeable, Functor, Data.Foldable.Foldable, Data.Traversable.Traversable)
+
+-- Purposely not providing this instance.  It used to use 'equivCookieJar'
+-- semantics before 0.7.0, but should, if anything, use 'equalCookieJar'
+-- semantics.
+--
+-- instance Exception Eq
 
 newtype ResponseClose = ResponseClose { runResponseClose :: IO () }
     deriving T.Typeable
 instance Show ResponseClose where
     show _ = "ResponseClose"
-instance Eq ResponseClose where
-    _ == _ = True
 
 -- | Settings for a @Manager@. Please use the 'defaultManagerSettings' function and then modify
 -- individual settings. For more information, see <http://www.yesodweb.com/book/settings-types>.

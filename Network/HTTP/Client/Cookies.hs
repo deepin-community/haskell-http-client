@@ -14,6 +14,7 @@ module Network.HTTP.Client.Cookies
     , removeExistingCookieFromCookieJar
     , domainMatches
     , isIpAddress
+    , isPotentiallyTrustworthyOrigin
     , defaultPath
     ) where
 
@@ -29,6 +30,8 @@ import Blaze.ByteString.Builder
 import qualified Network.PublicSuffixList.Lookup as PSL
 import Data.Text.Encoding (decodeUtf8With)
 import Data.Text.Encoding.Error (lenientDecode)
+import qualified Data.IP as IP
+import Text.Read (readMaybe)
 
 import Network.HTTP.Client.Types as Req
 
@@ -100,7 +103,7 @@ removeExistingCookieFromCookieJar cookie cookie_jar' = (mc, CJ lc)
   where (mc, lc) = removeExistingCookieFromCookieJarHelper cookie (expose cookie_jar')
         removeExistingCookieFromCookieJarHelper _ [] = (Nothing, [])
         removeExistingCookieFromCookieJarHelper c (c' : cs)
-          | c == c' = (Just c', cs)
+          | c `equivCookie` c' = (Just c', cs)
           | otherwise = (cookie', c' : cookie_jar'')
           where (cookie', cookie_jar'') = removeExistingCookieFromCookieJarHelper c cs
 
@@ -110,6 +113,37 @@ rejectPublicSuffixes = True
 
 isPublicSuffix :: BS.ByteString -> Bool
 isPublicSuffix = PSL.isSuffix . decodeUtf8With lenientDecode
+
+-- | Algorithm described in \"Secure Contexts\", Section 3.1, \"Is origin potentially trustworthy?\"
+--
+-- Note per RFC6265 section 5.4 user agent is free to define the meaning of "secure" protocol.
+--
+-- See:
+-- https://w3c.github.io/webappsec-secure-contexts/#is-origin-trustworthy
+isPotentiallyTrustworthyOrigin :: Bool          -- ^ True if HTTPS
+                               -> BS.ByteString -- ^ Host
+                               -> Bool          -- ^ Whether or not the origin is potentially trustworthy
+isPotentiallyTrustworthyOrigin secure host
+  | secure = True             -- step 3
+  | isLoopbackAddr4 = True    -- step 4, part 1
+  | isLoopbackAddr6 = True    -- step 4, part 2
+  | isLoopbackHostname = True -- step 5
+  | otherwise = False
+  where isLoopbackHostname =
+               host == "localhost"
+            || host == "localhost."
+            || BS.isSuffixOf ".localhost" host
+            || BS.isSuffixOf ".localhost." host
+        isLoopbackAddr4 =
+          fmap (take 1 . IP.fromIPv4) (readMaybe (S8.unpack host)) == Just [127]
+        isLoopbackAddr6 =
+          fmap IP.toHostAddress6 maddr6 == Just (0, 0, 0, 1)
+        maddr6 = do
+          (c1, rest1) <- S8.uncons host
+          (rest2, c2) <- S8.unsnoc rest1
+          case [c1, c2] of
+            "[]" -> readMaybe (S8.unpack rest2)
+            _ -> Nothing
 
 -- | This corresponds to the eviction algorithm described in Section 5.3 \"Storage Model\"
 evictExpiredCookies :: CookieJar  -- ^ Input cookie jar
@@ -143,12 +177,12 @@ computeCookieString request cookie_jar now is_http_api = (output_line, cookie_ja
                 condition2 = pathMatches (Req.path request) (cookie_path cookie)
                 condition3
                   | not (cookie_secure_only cookie) = True
-                  | otherwise = Req.secure request
+                  | otherwise = isPotentiallyTrustworthyOrigin (Req.secure request) (Req.host request)
                 condition4
                   | not (cookie_http_only cookie) = True
                   | otherwise = is_http_api
         matching_cookies = filter matching_cookie $ expose cookie_jar
-        output_cookies =  map (\ c -> (cookie_name c, cookie_value c)) $ L.sort matching_cookies
+        output_cookies =  map (\ c -> (cookie_name c, cookie_value c)) $ L.sortBy compareCookies matching_cookies
         output_line = toByteString $ renderCookies $ output_cookies
         folding_function cookie_jar'' cookie = case removeExistingCookieFromCookieJar cookie cookie_jar'' of
           (Just c, cookie_jar''') -> insertIntoCookieJar (c {cookie_last_access_time = now}) cookie_jar'''
