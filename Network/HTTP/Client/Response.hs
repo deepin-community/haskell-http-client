@@ -4,6 +4,7 @@ module Network.HTTP.Client.Response
     ( getRedirectedRequest
     , getResponse
     , lbsResponse
+    , getOriginalRequest
     ) where
 
 import Data.ByteString (ByteString)
@@ -96,7 +97,14 @@ getResponse timeout' req@(Request {..}) mconn cont = do
 
         -- should we put this connection back into the connection manager?
         toPut = Just "close" /= lookup "connection" hs && version > W.HttpVersion 1 0
-        cleanup bodyConsumed = managedRelease mconn $ if toPut && bodyConsumed then Reuse else DontReuse
+        cleanup bodyConsumed = do
+            managedRelease mconn $ if toPut && bodyConsumed then Reuse else DontReuse
+            -- Keep alive the `Managed Connection` until we're done with it, to prevent an early
+            -- collection.
+            -- Reasoning: as long as someone holds a reference to the explicit cleanup,
+            -- we shouldn't perform an implicit cleanup.
+            keepAlive mconn
+
 
     body <-
         -- RFC 2616 section 4.4_1 defines responses that must not include a body
@@ -123,6 +131,7 @@ getResponse timeout' req@(Request {..}) mconn cont = do
         , responseBody = body
         , responseCookieJar = Data.Monoid.mempty
         , responseClose' = ResponseClose (cleanup False)
+        , responseOriginalRequest = req {requestBody = ""}
         }
 
 -- | Does this response have no body?
@@ -133,3 +142,11 @@ hasNoBody "HEAD" _ = True
 hasNoBody _ 204 = True
 hasNoBody _ 304 = True
 hasNoBody _ i = 100 <= i && i < 200
+
+-- | Retrieve the orignal 'Request' from a 'Response'
+--
+-- Note that the 'requestBody' is not available and always set to empty.
+--
+-- @since 0.7.8
+getOriginalRequest :: Response a -> Request
+getOriginalRequest = responseOriginalRequest
